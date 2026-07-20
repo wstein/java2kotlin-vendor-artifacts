@@ -7,14 +7,6 @@ on:
         description: "Artifact release version only (for example 2026.07.20.1)"
         required: true
         type: string
-      flix_commit:
-        description: "Immutable 40-character commit SHA in wstein/flix-fork"
-        required: true
-        type: string
-      rewrite_commit:
-        description: "Immutable 40-character commit SHA in wstein/rewrite-fork"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -28,26 +20,46 @@ jobs:
       - id: release
         env:
           VERSION: ${{ inputs.version }}
-          FLIX_COMMIT: ${{ inputs.flix_commit }}
-          REWRITE_COMMIT: ${{ inputs.rewrite_commit }}
         run: |
           set -euo pipefail
           if ! [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]*$ ]]; then
             echo "version must be YYYY.MM.DD.N, where N starts at 1" >&2
             exit 1
           fi
-          if ! [[ "$FLIX_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "flix_commit must be a lowercase, 40-character commit SHA" >&2
-            exit 1
-          fi
-          if ! [[ "$REWRITE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "rewrite_commit must be a lowercase, 40-character commit SHA" >&2
-            exit 1
-          fi
           echo "tag=vendor-$VERSION" >> "$GITHUB_OUTPUT"
 
-  build:
+  tag-sources:
     needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      flix_commit: ${{ steps.tag.outputs.flix_commit }}
+      rewrite_commit: ${{ steps.tag.outputs.rewrite_commit }}
+    steps:
+      - id: tag
+        env:
+          # This fine-grained PAT needs Contents: Read and write on both
+          # forks. A workflow GITHUB_TOKEN is confined to this repository.
+          GH_TOKEN: ${{ secrets.VENDOR_FORKS_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" || { echo "VENDOR_FORKS_TOKEN is required" >&2; exit 1; }
+          tag_head() {
+            local repo="$1"
+            local sha
+            sha="$(gh api "repos/$repo/git/ref/heads/feature/java2kotlin" --jq .object.sha)"
+            if gh api "repos/$repo/git/ref/tags/$TAG" >/dev/null 2>&1; then
+              echo "$repo already has tag $TAG; refusing to retag" >&2
+              exit 1
+            fi
+            gh api --method POST "repos/$repo/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$sha" >/dev/null
+            printf '%s\n' "$sha"
+          }
+          echo "flix_commit=$(tag_head wstein/flix-fork)" >> "$GITHUB_OUTPUT"
+          echo "rewrite_commit=$(tag_head wstein/rewrite-fork)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [validate, tag-sources]
     strategy:
       fail-fast: false
       matrix:
@@ -66,19 +78,19 @@ jobs:
             publish: false
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Check out Flix at the requested immutable commit
+      - name: Check out tagged Flix source
         uses: actions/checkout@v5
         with:
           repository: wstein/flix-fork
-          ref: ${{ inputs.flix_commit }}
+          ref: ${{ needs.validate.outputs.tag }}
           path: flix
           fetch-depth: 1
 
-      - name: Check out Rewrite at the requested immutable commit
+      - name: Check out tagged Rewrite source
         uses: actions/checkout@v5
         with:
           repository: wstein/rewrite-fork
-          ref: ${{ inputs.rewrite_commit }}
+          ref: ${{ needs.validate.outputs.tag }}
           path: rewrite
           fetch-depth: 1
 
@@ -90,8 +102,8 @@ jobs:
 
       - name: Verify immutable source identities
         env:
-          EXPECTED_FLIX: ${{ inputs.flix_commit }}
-          EXPECTED_REWRITE: ${{ inputs.rewrite_commit }}
+          EXPECTED_FLIX: ${{ needs.tag-sources.outputs.flix_commit }}
+          EXPECTED_REWRITE: ${{ needs.tag-sources.outputs.rewrite_commit }}
         run: |
           set -euo pipefail
           test "$(git -C flix rev-parse HEAD)" = "$EXPECTED_FLIX"
@@ -121,8 +133,8 @@ jobs:
         if: matrix.publish
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-          FLIX_COMMIT: ${{ inputs.flix_commit }}
-          REWRITE_COMMIT: ${{ inputs.rewrite_commit }}
+          FLIX_COMMIT: ${{ needs.tag-sources.outputs.flix_commit }}
+          REWRITE_COMMIT: ${{ needs.tag-sources.outputs.rewrite_commit }}
         run: |
           set -euo pipefail
           mkdir -p dist/m2-repository/org
@@ -157,7 +169,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [validate, build]
+    needs: [validate, tag-sources, build]
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts
@@ -170,8 +182,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
-          FLIX_COMMIT: ${{ inputs.flix_commit }}
-          REWRITE_COMMIT: ${{ inputs.rewrite_commit }}
+          FLIX_COMMIT: ${{ needs.tag-sources.outputs.flix_commit }}
+          REWRITE_COMMIT: ${{ needs.tag-sources.outputs.rewrite_commit }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
