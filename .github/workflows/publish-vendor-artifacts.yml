@@ -54,15 +54,16 @@ jobs:
         include:
           - runner: ubuntu-latest
             platform: linux-amd64
+            publish: true
           # The explicit ARM label prevents a future ubuntu-latest image
           # change from silently changing the architecture of this asset.
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
-          # GitHub-hosted `macos-latest` is Apple Silicon. Keep this explicit
-          # platform label in the release assets rather than implying Intel
-          # compatibility.
+            publish: false
+          # GitHub-hosted `macos-latest` is Apple Silicon.
           - runner: macos-latest
             platform: macos-arm64
+            publish: false
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out Flix at the requested immutable commit
@@ -112,23 +113,28 @@ jobs:
           :rewrite-properties:publishToMavenLocal
           :rewrite-xml:publishToMavenLocal
 
-      - name: Package vendor artifacts
+      # Flix and the published OpenRewrite modules are JVM artifacts. Build
+      # them on all three runners as a compatibility gate, but publish one
+      # canonical bundle only; three platform-labelled copies imply a false
+      # platform dependency and make consumers choose unnecessarily.
+      - name: Package canonical vendor artifacts
+        if: matrix.publish
         env:
-          PLATFORM: ${{ matrix.platform }}
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           FLIX_COMMIT: ${{ inputs.flix_commit }}
           REWRITE_COMMIT: ${{ inputs.rewrite_commit }}
         run: |
           set -euo pipefail
           mkdir -p dist/m2-repository/org
-          cp flix/out/flix/assembly.dest/out.jar "dist/flix-${PLATFORM}.jar"
+          cp flix/out/flix/assembly.dest/out.jar dist/flix.jar
           cp -R "$HOME/.m2/repository/org/openrewrite" dist/m2-repository/org/
-          tar -C dist -czf "dist/rewrite-m2-${PLATFORM}.tar.gz" m2-repository
+          tar -C dist -czf dist/rewrite-m2.tar.gz m2-repository
           rm -rf dist/m2-repository
-          cat > "dist/manifest-${PLATFORM}.json" <<EOF
+          cat > dist/manifest.json <<EOF
           {
             "releaseTag": "${RELEASE_TAG}",
-            "platform": "${PLATFORM}",
+            "canonicalBuildPlatform": "linux-amd64",
+            "validatedPlatforms": ["linux-amd64", "linux-arm64", "macos-arm64"],
             "flixCommit": "${FLIX_COMMIT}",
             "rewriteCommit": "${REWRITE_COMMIT}",
             "files": {}
@@ -139,13 +145,14 @@ jobs:
             # `shasum` is available on both GitHub's Linux and Intel macOS
             # images; GNU-only `sha256sum` is not available by default on
             # macOS.
-            shasum -a 256 "flix-${PLATFORM}.jar" "rewrite-m2-${PLATFORM}.tar.gz" > "SHA256SUMS-${PLATFORM}.txt"
+            shasum -a 256 flix.jar rewrite-m2.tar.gz > SHA256SUMS.txt
           )
 
-      - name: Upload platform release files
+      - name: Upload canonical release files
+        if: matrix.publish
         uses: actions/upload-artifact@v4
         with:
-          name: vendor-${{ matrix.platform }}
+          name: vendor-release
           path: dist/
           if-no-files-found: error
 
