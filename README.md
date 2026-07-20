@@ -20,9 +20,9 @@ Run **Publish vendor artifacts** from Actions and provide:
 
 The workflow builds both inputs on Linux AMD64, Linux ARM64, and Apple Silicon
 macOS. These are compatibility gates, not separate distributions: the release
-contains one generic `flix.jar` and one generic local-Maven bundle built on
-Linux AMD64, plus a checksum manifest. Consumers verify the generic files;
-they do not select a platform variant.
+contains one generic, versioned `flix-vendor-*.jar` and one generic,
+versioned local-Maven bundle built on Linux AMD64, plus a checksum manifest.
+Consumers verify the generic files; they do not select a platform variant.
 
 The generated Rewrite bundle contains the `org/openrewrite` subtree of a
 Maven local repository. It intentionally does not duplicate third-party Maven

@@ -126,11 +126,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/m2-repository/org
-          cp flix/out/flix/assembly.dest/out.jar dist/flix.jar
+          cp flix/out/flix/assembly.dest/out.jar "dist/flix-${RELEASE_TAG}.jar"
           cp -R "$HOME/.m2/repository/org/openrewrite" dist/m2-repository/org/
-          tar -C dist -czf dist/rewrite-m2.tar.gz m2-repository
+          tar -C dist -czf "dist/rewrite-m2-${RELEASE_TAG}.tar.gz" m2-repository
           rm -rf dist/m2-repository
-          cat > dist/manifest.json <<EOF
+          cat > "dist/manifest-${RELEASE_TAG}.json" <<EOF
           {
             "releaseTag": "${RELEASE_TAG}",
             "canonicalBuildPlatform": "linux-amd64",
@@ -145,7 +145,7 @@ jobs:
             # `shasum` is available on both GitHub's Linux and Intel macOS
             # images; GNU-only `sha256sum` is not available by default on
             # macOS.
-            shasum -a 256 flix.jar rewrite-m2.tar.gz > SHA256SUMS.txt
+            shasum -a 256 "flix-${RELEASE_TAG}.jar" "rewrite-m2-${RELEASE_TAG}.tar.gz" > "SHA256SUMS-${RELEASE_TAG}.txt"
           )
 
       - name: Upload canonical release files
