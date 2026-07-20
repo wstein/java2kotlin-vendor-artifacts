@@ -1,0 +1,171 @@
+name: Publish vendor artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Artifact release version only (for example 2026.07.20.1)"
+        required: true
+        type: string
+      flix_commit:
+        description: "Immutable 40-character commit SHA in wstein/flix-fork"
+        required: true
+        type: string
+      rewrite_commit:
+        description: "Immutable 40-character commit SHA in wstein/rewrite-fork"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - id: release
+        env:
+          VERSION: ${{ inputs.version }}
+          FLIX_COMMIT: ${{ inputs.flix_commit }}
+          REWRITE_COMMIT: ${{ inputs.rewrite_commit }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]*$ ]]; then
+            echo "version must be YYYY.MM.DD.N, where N starts at 1" >&2
+            exit 1
+          fi
+          if ! [[ "$FLIX_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "flix_commit must be a lowercase, 40-character commit SHA" >&2
+            exit 1
+          fi
+          if ! [[ "$REWRITE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "rewrite_commit must be a lowercase, 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "tag=vendor-$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-amd64
+          # macos-13 is GitHub-hosted Intel macOS, rather than the ARM macOS
+          # image selected by newer macos-latest labels.
+          - runner: macos-13
+            platform: macos-amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out Flix at the requested immutable commit
+        uses: actions/checkout@v5
+        with:
+          repository: wstein/flix-fork
+          ref: ${{ inputs.flix_commit }}
+          path: flix
+          fetch-depth: 1
+
+      - name: Check out Rewrite at the requested immutable commit
+        uses: actions/checkout@v5
+        with:
+          repository: wstein/rewrite-fork
+          ref: ${{ inputs.rewrite_commit }}
+          path: rewrite
+          fetch-depth: 1
+
+      - name: Install JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Verify immutable source identities
+        env:
+          EXPECTED_FLIX: ${{ inputs.flix_commit }}
+          EXPECTED_REWRITE: ${{ inputs.rewrite_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git -C flix rev-parse HEAD)" = "$EXPECTED_FLIX"
+          test "$(git -C rewrite rev-parse HEAD)" = "$EXPECTED_REWRITE"
+
+      - name: Build Flix assembly
+        working-directory: flix
+        run: ./mill flix.assembly
+
+      - name: Publish required Rewrite modules locally
+        working-directory: rewrite
+        run: >-
+          ./gradlew
+          :rewrite-core:publishToMavenLocal
+          :rewrite-java:publishToMavenLocal
+          :rewrite-java-21:publishToMavenLocal
+          :rewrite-java-lombok:publishToMavenLocal
+          :rewrite-yaml:publishToMavenLocal
+          :rewrite-properties:publishToMavenLocal
+          :rewrite-xml:publishToMavenLocal
+
+      - name: Package vendor artifacts
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          FLIX_COMMIT: ${{ inputs.flix_commit }}
+          REWRITE_COMMIT: ${{ inputs.rewrite_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/m2-repository/org
+          cp flix/out/flix/assembly.dest/out.jar "dist/flix-${PLATFORM}.jar"
+          cp -R "$HOME/.m2/repository/org/openrewrite" dist/m2-repository/org/
+          tar -C dist -czf "dist/rewrite-m2-${PLATFORM}.tar.gz" m2-repository
+          rm -rf dist/m2-repository
+          cat > "dist/manifest-${PLATFORM}.json" <<EOF
+          {
+            "releaseTag": "${RELEASE_TAG}",
+            "platform": "${PLATFORM}",
+            "flixCommit": "${FLIX_COMMIT}",
+            "rewriteCommit": "${REWRITE_COMMIT}",
+            "files": {}
+          }
+          EOF
+          (
+            cd dist
+            # `shasum` is available on both GitHub's Linux and Intel macOS
+            # images; GNU-only `sha256sum` is not available by default on
+            # macOS.
+            shasum -a 256 "flix-${PLATFORM}.jar" "rewrite-m2-${PLATFORM}.tar.gz" > "SHA256SUMS-${PLATFORM}.txt"
+          )
+
+      - name: Upload platform release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          FLIX_COMMIT: ${{ inputs.flix_commit }}
+          REWRITE_COMMIT: ${{ inputs.rewrite_commit }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Refusing to modify existing release $TAG" >&2
+            exit 1
+          fi
+          gh release create "$TAG" release/* \
+            --title "$TAG" \
+            --notes "Built from wstein/flix-fork@$FLIX_COMMIT and wstein/rewrite-fork@$REWRITE_COMMIT on Linux AMD64 and Intel macOS."
