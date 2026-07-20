@@ -38,21 +38,25 @@ jobs:
       - id: tag
         env:
           # This fine-grained PAT needs Contents: Read and write on both
-          # forks. A workflow GITHUB_TOKEN is confined to this repository.
-          GH_TOKEN: ${{ secrets.VENDOR_FORKS_TOKEN }}
+          # forks. A workflow GITHUB_TOKEN is confined to this repository;
+          # it is used only to verify tags on retries.
+          GH_TOKEN: ${{ secrets.VENDOR_FORKS_TOKEN || github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          test -n "$GH_TOKEN" || { echo "VENDOR_FORKS_TOKEN is required" >&2; exit 1; }
           tag_head() {
             local repo="$1"
-            local sha
+            local sha tagged_sha
             sha="$(gh api "repos/$repo/git/ref/heads/feature/java2kotlin" --jq .object.sha)"
             if gh api "repos/$repo/git/ref/tags/$TAG" >/dev/null 2>&1; then
-              echo "$repo already has tag $TAG; refusing to retag" >&2
-              exit 1
+              tagged_sha="$(gh api "repos/$repo/git/ref/tags/$TAG" --jq .object.sha)"
+              test "$tagged_sha" = "$sha" || {
+                echo "$repo tag $TAG does not identify the current feature/java2kotlin head" >&2
+                exit 1
+              }
+            else
+              gh api --method POST "repos/$repo/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$sha" >/dev/null
             fi
-            gh api --method POST "repos/$repo/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$sha" >/dev/null
             printf '%s\n' "$sha"
           }
           echo "flix_commit=$(tag_head wstein/flix-fork)" >> "$GITHUB_OUTPUT"
