@@ -54,10 +54,15 @@ jobs:
         include:
           - runner: ubuntu-latest
             platform: linux-amd64
-          # macos-13 is GitHub-hosted Intel macOS, rather than the ARM macOS
-          # image selected by newer macos-latest labels.
-          - runner: macos-13
-            platform: macos-amd64
+          # The explicit ARM label prevents a future ubuntu-latest image
+          # change from silently changing the architecture of this asset.
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          # GitHub-hosted `macos-latest` is Apple Silicon. Keep this explicit
+          # platform label in the release assets rather than implying Intel
+          # compatibility.
+          - runner: macos-latest
+            platform: macos-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out Flix at the requested immutable commit

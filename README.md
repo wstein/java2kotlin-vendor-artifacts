@@ -18,10 +18,10 @@ Run **Publish vendor artifacts** from Actions and provide:
 - the immutable Flix fork commit SHA; and
 - the immutable Rewrite fork commit SHA.
 
-The workflow builds both inputs on Linux AMD64 and Intel macOS, then attaches
-per-platform Flix JAR and local-Maven bundles plus a checksum manifest to the
-GitHub Release. Consumers must select an asset by platform and verify it
-against the matching manifest before use.
+The workflow builds both inputs on Linux AMD64, Linux ARM64, and Apple Silicon
+macOS, then attaches per-platform Flix JAR and local-Maven bundles plus a
+checksum manifest to the GitHub Release. Consumers must select an asset by
+platform and verify it against the matching manifest before use.
 
 The generated Rewrite bundle contains the `org/openrewrite` subtree of a
 Maven local repository. It intentionally does not duplicate third-party Maven
