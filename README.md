@@ -21,10 +21,8 @@ fine-grained token that has **Contents: read and write** access to
 `wstein/flix-fork` and `wstein/rewrite-fork`. It is used solely to create the
 matching immutable source tags.
 
-The workflow builds both inputs on Linux AMD64, Linux ARM64, and Apple Silicon
-macOS. These are compatibility gates, not separate distributions: the release
-contains one generic, versioned `flix-vendor-*.jar` and one generic,
-versioned local-Maven bundle built on Linux AMD64, plus a checksum manifest.
+The workflow builds one generic, versioned `flix-vendor-*.jar` and one generic,
+versioned local-Maven bundle on Linux AMD64, plus a checksum manifest.
 Consumers verify the generic files; they do not select a platform variant.
 
 The generated Rewrite bundle contains the `org/openrewrite` subtree of a

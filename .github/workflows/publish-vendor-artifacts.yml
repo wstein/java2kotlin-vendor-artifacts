@@ -60,23 +60,7 @@ jobs:
 
   build:
     needs: [validate, tag-sources]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            platform: linux-amd64
-            publish: true
-          # The explicit ARM label prevents a future ubuntu-latest image
-          # change from silently changing the architecture of this asset.
-          - runner: ubuntu-24.04-arm
-            platform: linux-arm64
-            publish: false
-          # GitHub-hosted `macos-latest` is Apple Silicon.
-          - runner: macos-latest
-            platform: macos-arm64
-            publish: false
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - name: Check out tagged Flix source
         uses: actions/checkout@v5
@@ -126,11 +110,9 @@ jobs:
           :rewrite-xml:publishToMavenLocal
 
       # Flix and the published OpenRewrite modules are JVM artifacts. Build
-      # them on all three runners as a compatibility gate, but publish one
-      # canonical bundle only; three platform-labelled copies imply a false
+      # one canonical bundle; platform-labelled copies would imply a false
       # platform dependency and make consumers choose unnecessarily.
       - name: Package canonical vendor artifacts
-        if: matrix.publish
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           FLIX_COMMIT: ${{ needs.tag-sources.outputs.flix_commit }}
@@ -145,8 +127,7 @@ jobs:
           cat > "dist/manifest-${RELEASE_TAG}.json" <<EOF
           {
             "releaseTag": "${RELEASE_TAG}",
-            "canonicalBuildPlatform": "linux-amd64",
-            "validatedPlatforms": ["linux-amd64", "linux-arm64", "macos-arm64"],
+            "buildPlatform": "linux-amd64",
             "flixCommit": "${FLIX_COMMIT}",
             "rewriteCommit": "${REWRITE_COMMIT}",
             "files": {}
@@ -161,7 +142,6 @@ jobs:
           )
 
       - name: Upload canonical release files
-        if: matrix.publish
         uses: actions/upload-artifact@v4
         with:
           name: vendor-release
