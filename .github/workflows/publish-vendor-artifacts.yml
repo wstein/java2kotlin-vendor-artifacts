@@ -310,11 +310,25 @@ jobs:
           import org.openrewrite.flix.spi.FlixTyper;
 
           public class TyperProbe {
-              public static void main(String[] args) {
+              public static void main(String[] args) throws Exception {
                   FlixTypeCheckResult typed = FlixTyper.typeCheck(
                           "Probe.flix", "def main(): Unit \\ IO = println(\"hi\")\n");
                   if (!typed.isTyped() || typed.getExpressions().isEmpty()) {
                       throw new AssertionError("nothing typed: " + typed.getDiagnostics());
+                  }
+                  // Exercise the exact getter surface rewrite-flix's FlixTyperAdapter
+                  // reflects on, so a rename here fails the release rather than
+                  // silently breaking type attribution downstream.
+                  Object e = typed.getExpressions().get(0);
+                  Class<?> ec = e.getClass();
+                  int beginLine = (int) ec.getMethod("getBeginLine").invoke(e);
+                  ec.getMethod("getBeginColumn").invoke(e);
+                  ec.getMethod("getEndLine").invoke(e);
+                  ec.getMethod("getEndColumn").invoke(e);
+                  String ty = (String) ec.getMethod("getType").invoke(e);
+                  String ef = (String) ec.getMethod("getEffect").invoke(e);
+                  if (beginLine < 1 || ty.isEmpty() || ef.isEmpty()) {
+                      throw new AssertionError("expression getters returned nothing usable");
                   }
                   // A source that does not resolve must report diagnostics rather than
                   // pretend to have types, which is what a consumer has to handle.

@@ -3,3 +3,12 @@ tools/shade/build/
 tools/shade/flix-parser-shrunk.jar
 r8.jar
 dist/
+# typer build artifacts (mirrors the parser's shade dir)
+tools/shade-typer/build/
+tools/shade-typer/typer-merged.jar
+typer-merged.jar
+typer-entries.txt
+typer-probe/
+TyperProbe.java
+Probe.java
+entries.txt
