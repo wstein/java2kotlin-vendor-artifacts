@@ -1,5 +1,19 @@
 name: Publish vendor artifacts
 
+# The build is split into two producer jobs and a release job.
+#
+# `parser` and `rewrite` are separate because most of the work is genuinely
+# independent: only rewrite-flix needs the parser jar, while the other seven
+# OpenRewrite modules do not, so they build on a second runner instead of
+# queueing behind the Flix assembly. Splitting also makes failure attribution
+# and re-runs land where the problem is -- a rewrite-side test failure re-runs
+# the rewrite job rather than a four-minute Flix build.
+#
+# They still share one version and one tag. Separate release cadences would be
+# the logical end state, but rewrite-flix does not yet pin a published parser
+# artifact, so the shared tag is currently the only thing guaranteeing the two
+# halves match.
+
 on:
   workflow_dispatch:
     inputs:
@@ -28,9 +42,14 @@ jobs:
           fi
           echo "tag=vendor-$VERSION" >> "$GITHUB_OUTPUT"
 
-  build:
+  # ---------------------------------------------------------------------------
+  # The Flix side: assembly, facade, shrink, shade.
+  # ---------------------------------------------------------------------------
+  parser:
     needs: validate
     runs-on: ubuntu-latest
+    outputs:
+      flix_commit: ${{ steps.flix.outputs.sha }}
     steps:
       - name: Check out this repository
         uses: actions/checkout@v7
@@ -41,14 +60,6 @@ jobs:
           repository: wstein/flix-fork
           ref: ${{ needs.validate.outputs.tag }}
           path: flix
-          fetch-depth: 1
-
-      - name: Check out tagged Rewrite source
-        uses: actions/checkout@v7
-        with:
-          repository: wstein/rewrite-fork
-          ref: ${{ needs.validate.outputs.tag }}
-          path: rewrite
           fetch-depth: 1
 
       - name: Install JDK 21
@@ -133,10 +144,6 @@ jobs:
       # That also means the jar only has to RUN: consumers compile against the
       # Java facade, never against the Scala classes, so pickle signatures need
       # not survive and the artifact can be both aggressively shrunk and shaded.
-      #
-      # Requires the flix fork branch being built to carry the decoupling of
-      # Lexer.run/Parser2.run from the Flix god-object; without it the whole
-      # compiler, including the JVM backend, is reachable and nothing shrinks.
       - name: Build the parser jar (facade + ProGuard)
         env:
           PROGUARD_VERSION: "7.9.1"
@@ -209,14 +216,11 @@ jobs:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: gradle -p tools/shade shadowJar -PartifactVersion="${RELEASE_TAG}"
 
-      # Prove the published jar is usable BEFORE publishing it, by exercising it
-      # the way a consumer will: plain Java, with only the shaded jar on the
-      # classpath and no scala-library anywhere.
-      #
-      # This is the guard that was missing. A previous release shipped a parser
-      # jar that could not be compiled against at all and failed at runtime with
-      # NoSuchMethodError on ReadAst$Root, and nothing in the pipeline noticed.
-      - name: Verify the published jar is consumable
+      # A cheap structural check before the jar leaves this job. The real proof
+      # is the rewrite job, which builds rewrite-flix against it and runs its
+      # full suite -- but that is a different runner, and failing here names the
+      # cause directly.
+      - name: Verify the parser jar
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: |
@@ -241,55 +245,94 @@ jobs:
             echo "Shaded jar has no facade; consumers have no entry point." >&2
             exit 1
           fi
+          echo "parser jar structurally ok"
 
-          mkdir -p probe
-          cat > Probe.java <<'JAVA'
-          import org.openrewrite.flix.spi.FlixCstElement;
-          import org.openrewrite.flix.spi.FlixCstNode;
-          import org.openrewrite.flix.spi.FlixCstToken;
-          import org.openrewrite.flix.spi.FlixFrontEnd;
-          import org.openrewrite.flix.spi.FlixParseResult;
+      - name: Stage the Flix artifacts
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp flix/out/flix/assembly.dest/out.jar "dist/flix-${RELEASE_TAG}.jar"
+          # One parser artifact: shrunk, shaded, and consumable from plain Java.
+          # It replaces the earlier trio -- an R8 jar that could not be compiled
+          # against, an unshaded copy to work around that, and a
+          # signature-preserving API jar for a Scala consumer that no longer
+          # exists now that the boundary is Java.
+          cp "tools/shade/build/libs/flix-parser-${RELEASE_TAG}.jar" "dist/flix-parser-${RELEASE_TAG}.jar"
 
-          public class Probe {
-              public static void main(String[] args) {
-                  String source = "def main(): Unit \\ IO = println(\"hi\")\n";
-                  FlixParseResult result = FlixFrontEnd.parse("Probe.flix", source);
-                  if (!result.getDiagnostics().isEmpty()) {
-                      throw new AssertionError("unexpected diagnostics: " + result.getDiagnostics());
-                  }
-                  // Reconstructing the source from token offsets proves the CST covers
-                  // the file, which is what lossless printing depends on.
-                  StringBuilder out = new StringBuilder();
-                  int[] cursor = {0};
-                  rebuild(result.getTree(), source, out, cursor);
-                  out.append(source.substring(cursor[0]));
-                  if (!out.toString().equals(source)) {
-                      throw new AssertionError("round trip differed: " + out);
-                  }
-                  System.out.println("parser jar is consumable from plain Java");
-              }
+      - name: Upload the Flix artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: parser
+          path: dist/
+          if-no-files-found: error
 
-              static void rebuild(FlixCstElement e, String src, StringBuilder out, int[] cursor) {
-                  if (e instanceof FlixCstToken) {
-                      FlixCstToken t = (FlixCstToken) e;
-                      out.append(src, cursor[0], t.getStart()).append(src, t.getStart(), t.getEnd());
-                      cursor[0] = t.getEnd();
-                      return;
-                  }
-                  for (FlixCstElement c : ((FlixCstNode) e).getChildren()) {
-                      rebuild(c, src, out, cursor);
-                  }
-              }
-          }
-          JAVA
+  # ---------------------------------------------------------------------------
+  # The Rewrite side. Needs `parser` only because rewrite-flix consumes the jar;
+  # the other modules would build without it.
+  # ---------------------------------------------------------------------------
+  rewrite:
+    needs: [validate, parser]
+    runs-on: ubuntu-latest
+    outputs:
+      rewrite_commit: ${{ steps.rewrite.outputs.sha }}
+    steps:
+      - name: Check out tagged Rewrite source
+        uses: actions/checkout@v7
+        with:
+          repository: wstein/rewrite-fork
+          ref: ${{ needs.validate.outputs.tag }}
+          path: rewrite
+          fetch-depth: 1
 
-          # Use the JDK this workflow installed, not whatever `javac` PATH resolves
-          # to. Later actions reorder PATH, and the runner image's default javac is
-          # older than the JDK the facade is compiled against -- which fails as
-          # "class file has wrong version 65.0, should be 61.0", i.e. the artifact
-          # is fine and the compiler reading it is too old.
-          "${JAVA_HOME}/bin/javac" -cp "$JAR" -d probe Probe.java
-          "${JAVA_HOME}/bin/java" -cp "probe:$JAR" Probe
+      # Checked out for its .flix sources, not to build it: the standard library,
+      # examples and compiler tests are ~880 files, and rewrite-flix's round-trip
+      # sweep runs over them. That corpus is the strongest evidence the parser jar
+      # actually works, and it costs a shallow clone.
+      - name: Check out tagged Flix source (corpus)
+        uses: actions/checkout@v7
+        with:
+          repository: wstein/flix-fork
+          ref: ${{ needs.validate.outputs.tag }}
+          path: flix
+          fetch-depth: 1
+
+      - name: Install JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Resolve the Rewrite commit
+        id: rewrite
+        run: echo "sha=$(git -C rewrite rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download the parser jar
+        uses: actions/download-artifact@v8
+        with:
+          name: parser
+          path: parser
+
+      # rewrite-flix is excluded from the build unless this jar is present -- the
+      # guard in settings.gradle.kts exists precisely so the module can be built
+      # against a locally supplied parser. Dropping the freshly built jar here is
+      # what makes the tests below exercise the artifact about to be published,
+      # rather than something merely similar to it.
+      - name: Supply the parser jar to rewrite-flix
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p rewrite/rewrite-flix/libs
+          cp "parser/flix-parser-${RELEASE_TAG}.jar" rewrite/rewrite-flix/libs/flix-facade.jar
+          echo "supplied $(du -h rewrite/rewrite-flix/libs/flix-facade.jar | cut -f1) parser jar"
+
+      # The real consumability proof: rewrite-flix compiles against the jar and
+      # its suite runs, including the round-trip sweep over the whole Flix corpus.
+      - name: Test rewrite-flix against the parser jar
+        working-directory: rewrite
+        run: ./gradlew :rewrite-flix:test "-Dflix.corpus=${GITHUB_WORKSPACE}/flix"
 
       - name: Publish required Rewrite modules locally
         working-directory: rewrite
@@ -302,29 +345,52 @@ jobs:
           :rewrite-yaml:publishToMavenLocal
           :rewrite-properties:publishToMavenLocal
           :rewrite-xml:publishToMavenLocal
+          :rewrite-flix:publishToMavenLocal
 
-      # Flix and the published OpenRewrite modules are JVM artifacts. Build
-      # one canonical bundle; platform-labelled copies would imply a false
-      # platform dependency and make consumers choose unnecessarily.
-      - name: Package canonical vendor artifacts
+      # The bundle contains the org/openrewrite subtree of a Maven local
+      # repository. It intentionally does not duplicate third-party dependencies,
+      # which the consumer's build tool resolves normally.
+      - name: Package the Rewrite bundle
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          FLIX_COMMIT="$(git -C flix rev-parse HEAD)"
-          REWRITE_COMMIT="$(git -C rewrite rev-parse HEAD)"
           mkdir -p dist/m2-repository/org
-          cp flix/out/flix/assembly.dest/out.jar "dist/flix-${RELEASE_TAG}.jar"
-          # One parser artifact: shrunk, shaded, and consumable from plain Java.
-          # It replaces the earlier trio -- an R8 jar that could not be compiled
-          # against, an unshaded copy to work around that, and a
-          # signature-preserving API jar for a Scala consumer that no longer
-          # exists now that the boundary is Java.
-          cp "tools/shade/build/libs/flix-parser-${RELEASE_TAG}.jar" "dist/flix-parser-${RELEASE_TAG}.jar"
           cp -R "$HOME/.m2/repository/org/openrewrite" dist/m2-repository/org/
           tar -C dist -czf "dist/rewrite-m2-${RELEASE_TAG}.tar.gz" m2-repository
           rm -rf dist/m2-repository
-          cat > "dist/manifest-${RELEASE_TAG}.json" <<EOF
+
+      - name: Upload the Rewrite bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: rewrite
+          path: dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Collect both sides, record provenance, publish.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [validate, parser, rewrite]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download both producers' artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+
+      # Flix and the published OpenRewrite modules are JVM artifacts. Build one
+      # canonical bundle; platform-labelled copies would imply a false platform
+      # dependency and make consumers choose unnecessarily.
+      - name: Write the manifest and checksums
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          FLIX_COMMIT: ${{ needs.parser.outputs.flix_commit }}
+          REWRITE_COMMIT: ${{ needs.rewrite.outputs.rewrite_commit }}
+        run: |
+          set -euo pipefail
+          cat > "release/manifest-${RELEASE_TAG}.json" <<EOF
           {
             "releaseTag": "${RELEASE_TAG}",
             "buildPlatform": "linux-amd64",
@@ -334,45 +400,27 @@ jobs:
           }
           EOF
           (
-            cd dist
+            cd release
             # `shasum` is available on both GitHub's Linux and Intel macOS
-            # images; GNU-only `sha256sum` is not available by default on
-            # macOS.
+            # images; GNU-only `sha256sum` is not available by default on macOS.
             shasum -a 256 \
               "flix-${RELEASE_TAG}.jar" \
               "flix-parser-${RELEASE_TAG}.jar" \
               "rewrite-m2-${RELEASE_TAG}.tar.gz" > "SHA256SUMS-${RELEASE_TAG}.txt"
           )
 
-      - name: Upload canonical release files
-        uses: actions/upload-artifact@v7
-        with:
-          name: vendor-release
-          path: dist/
-          if-no-files-found: error
-
-  release:
-    needs: [validate, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all platform artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: release
-          merge-multiple: true
-
       - name: Create immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
+          FLIX_COMMIT: ${{ needs.parser.outputs.flix_commit }}
+          REWRITE_COMMIT: ${{ needs.rewrite.outputs.rewrite_commit }}
         run: |
           set -euo pipefail
-          FLIX_COMMIT="$(jq -r .flixCommit release/manifest-*.json)"
-          REWRITE_COMMIT="$(jq -r .rewriteCommit release/manifest-*.json)"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Refusing to modify existing release $TAG" >&2
             exit 1
           fi
           gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
-            --notes "Built from wstein/flix-fork@$FLIX_COMMIT and wstein/rewrite-fork@$REWRITE_COMMIT on Linux AMD64, Linux ARM64, and Apple Silicon macOS."
+            --notes "Built from wstein/flix-fork@${FLIX_COMMIT} and wstein/rewrite-fork@${REWRITE_COMMIT}."
