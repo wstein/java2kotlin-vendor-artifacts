@@ -22,6 +22,7 @@ import ca.uwaterloo.flix.language.ast.{SourceLocation, Type, TypedAst}
 import java.nio.file.Paths
 import java.{util => ju}
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 
 /**
  * Type checking, behind a pure-Java boundary.
@@ -75,23 +76,21 @@ object FlixTyper {
     flix.addVirtualPath(Paths.get(inputPath), source)
     val (rootOpt, errors) = flix.check()
 
-    val diagnostics = new ju.ArrayList[String]()
-    errors.foreach(e => diagnostics.add(e.getClass.getSimpleName + ": " + e.summary))
+    // Transform once and expose as a Java view. `asJava` wraps the Scala collection
+    // in O(1) rather than copying it into a fresh java.util.List, and the map has to
+    // run either way, so nothing is copied twice. The elements are FlixTypedExpression
+    // and String -- plain data -- so the wrapper keeps no compiler AST alive.
+    val diagnostics: ju.List[String] =
+      errors.map(e => e.getClass.getSimpleName + ": " + e.summary).asJava
 
-    val expressions = new ju.ArrayList[FlixTypedExpression]()
-    rootOpt.foreach { root =>
-      val collected = mutable.ArrayBuffer.empty[TypedAst.Expr]
-      collect(root.defs, collected)
-      collected.foreach { e =>
-        if (belongsTo(e.loc, inputPath)) {
-          expressions.add(new FlixTypedExpression(
-            e.loc.start.lineOneIndexed, e.loc.start.colOneIndexed,
-            e.loc.end.lineOneIndexed, e.loc.end.colOneIndexed,
-            e.tpe.toString, e.eff.toString))
-        }
-      }
-    }
-    new FlixTypeCheckResult(expressions, diagnostics)
+    // Filter DURING the walk rather than collecting all expressions and filtering
+    // after. A five-line program types tens of thousands of expressions, almost all of
+    // them the standard library's; materialising them only to drop them is the
+    // expensive part. Keeping just the matches allocates a handful instead.
+    val kept = mutable.ArrayBuffer.empty[FlixTypedExpression]
+    rootOpt.foreach(root => collect(root.defs, inputPath, kept))
+
+    new FlixTypeCheckResult(kept.asJava, diagnostics)
   }
 
   /**
@@ -104,15 +103,23 @@ object FlixTyper {
    * `Type` and `SourceLocation` are Products too and are not descended into: they hold no
    * expressions, and walking them is wasted work on a hot path.
    */
-  private def collect(any: Any, out: mutable.ArrayBuffer[TypedAst.Expr]): Unit = any match {
+  private def collect(any: Any, inputPath: String,
+                      out: mutable.ArrayBuffer[FlixTypedExpression]): Unit = any match {
     case e: TypedAst.Expr =>
-      out += e
-      e.productIterator.foreach(collect(_, out))
+      // Keep only expressions belonging to the source under test; the rest are the
+      // standard library's, typed as a side effect of compiling the program.
+      if (belongsTo(e.loc, inputPath)) {
+        out += new FlixTypedExpression(
+          e.loc.start.lineOneIndexed, e.loc.start.colOneIndexed,
+          e.loc.end.lineOneIndexed, e.loc.end.colOneIndexed,
+          e.tpe.toString, e.eff.toString)
+      }
+      e.productIterator.foreach(collect(_, inputPath, out))
     case _: Type => ()
     case _: SourceLocation => ()
-    case m: scala.collection.Map[_, _] => m.foreach { case (_, v) => collect(v, out) }
-    case i: Iterable[_] => i.foreach(collect(_, out))
-    case p: Product => p.productIterator.foreach(collect(_, out))
+    case m: scala.collection.Map[_, _] => m.foreach { case (_, v) => collect(v, inputPath, out) }
+    case i: Iterable[_] => i.foreach(collect(_, inputPath, out))
+    case p: Product => p.productIterator.foreach(collect(_, inputPath, out))
     case _ => ()
   }
 
