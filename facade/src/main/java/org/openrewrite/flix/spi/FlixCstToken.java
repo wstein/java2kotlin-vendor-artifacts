@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package ca.uwaterloo.flix.openrewrite;
+package org.openrewrite.flix.spi;
 
 /**
  * A leaf token. Carries source offsets rather than text, so the consumer slices every

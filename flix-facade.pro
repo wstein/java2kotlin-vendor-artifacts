@@ -13,6 +13,6 @@
 -ignorewarnings
 -keepattributes *
 
--keep class ca.uwaterloo.flix.openrewrite.** { *; }
+-keep class org.openrewrite.flix.spi.** { *; }
 -keep class scala.runtime.** { *; }
 -keepclassmembers class * { ** MODULE$; }

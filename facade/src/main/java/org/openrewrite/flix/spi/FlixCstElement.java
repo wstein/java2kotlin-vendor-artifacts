@@ -13,12 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package ca.uwaterloo.flix.openrewrite;
+package org.openrewrite.flix.spi;
 
 /**
  * A node or a token in the concrete syntax tree handed to consumers.
  *
- * <p>Every type in this package is deliberately plain Java. The parser jar shades
+ * <p>This package is OpenRewrite's, not Flix's: the facade is consumer glue that
+ * upstream Flix would have no reason to carry, so it does not sit under
+ * {@code ca.uwaterloo.flix.*}. Every type in it is deliberately plain Java. The parser jar shades
  * Scala into a private namespace so it can coexist with another Scala version on one
  * classpath, and shading rewrites the Flix front-end's own public signatures --
  * {@code Lexer.run} would take a relocated {@code Map}. A consumer compiled against
