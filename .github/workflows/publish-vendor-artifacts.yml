@@ -334,6 +334,35 @@ jobs:
         working-directory: rewrite
         run: ./gradlew :rewrite-flix:test "-Dflix.corpus=${GITHUB_WORKSPACE}/flix"
 
+      # The sweep is opt-in: with no -Dflix.corpus it does not fail, it SKIPS, and
+      # a skipped test leaves the build green. So a typo in the property name, or
+      # Gradle not forwarding it, would quietly reduce this job to the narrow
+      # tests while still reporting success -- the exact false-green this pipeline
+      # has already shipped once. Assert the sweep actually executed.
+      - name: Confirm the corpus sweep ran
+        working-directory: rewrite
+        run: |
+          set -euo pipefail
+          XML=rewrite-flix/build/test-results/test/TEST-org.openrewrite.flix.FlixRoundTripTest.xml
+          if [ ! -f "$XML" ]; then
+            echo "No results for FlixRoundTripTest at $XML." >&2
+            exit 1
+          fi
+          python3 - "$XML" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+
+          suite = ET.parse(sys.argv[1]).getroot()
+          name = "roundTripsRealFlixSources"
+          for case in suite.iter("testcase"):
+              if case.get("name", "").startswith(name):
+                  if case.find("skipped") is not None:
+                      sys.exit(f"{name} was SKIPPED: the corpus property did not reach the test.")
+                  print(f"corpus sweep ran in {case.get('time')}s")
+                  break
+          else:
+              sys.exit(f"{name} did not run at all.")
+          PY
+
       - name: Publish required Rewrite modules locally
         working-directory: rewrite
         run: >-
