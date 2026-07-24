@@ -32,6 +32,9 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
+      - name: Check out this repository
+        uses: actions/checkout@v5
+
       - name: Check out tagged Flix source
         uses: actions/checkout@v5
         with:
