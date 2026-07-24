@@ -247,6 +247,89 @@ jobs:
           fi
           echo "parser jar structurally ok"
 
+      # The typer: type checking needs the WHOLE front-end plus the standard library,
+      # so it is a separate, much larger artifact and the parser jar stays slim. Two
+      # properties of Flix drive that split and are worth stating where the build is:
+      # typing is whole-program (a five-line file yields tens of thousands of typed
+      # expressions, nearly all of them the library's) and all-or-nothing (a source that
+      # does not resolve yields diagnostics and no types at all).
+      - name: Build the typer jar (facade + shade)
+        env:
+          SCALA_VERSION: "2.13.18"
+        run: |
+          set -euo pipefail
+          ASSEMBLY=flix/out/flix/assembly.dest/out.jar
+          SCALAC_CP="scalac/scala-compiler.jar:scalac/scala-library.jar:scalac/scala-reflect.jar"
+
+          mkdir -p typer-classes
+          find typer/src/main \( -name '*.scala' -o -name '*.java' \) > typer-sources.txt
+          find typer/src/main/java -name '*.java' > typer-java-sources.txt
+
+          "${JAVA_HOME}/bin/java" -cp "$SCALAC_CP" scala.tools.nsc.Main \
+            -classpath "$ASSEMBLY" -d typer-classes "@typer-sources.txt"
+          "${JAVA_HOME}/bin/javac" --release 21 -nowarn \
+            -cp "typer-classes:$ASSEMBLY" -d typer-classes "@typer-java-sources.txt"
+
+          # Merged rather than shrunk: see tools/shade-typer/build.gradle.
+          cp "$ASSEMBLY" tools/shade-typer/typer-merged.jar
+          (cd typer-classes && "${JAVA_HOME}/bin/jar" uf ../tools/shade-typer/typer-merged.jar org)
+
+      - name: Shade the typer jar
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: gradle -p tools/shade-typer shadowJar -PartifactVersion="${RELEASE_TAG}"
+
+      # The same consumability question as the parser, and the same answer: exercise it
+      # the way a consumer will, before publishing it.
+      - name: Verify the typer jar is consumable
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          JAR="tools/shade-typer/build/libs/flix-typer-${RELEASE_TAG}.jar"
+          unzip -Z1 "$JAR" > typer-entries.txt
+
+          if grep -qE '^scala/' typer-entries.txt; then
+            echo "Shaded typer jar still contains unshaded scala/**." >&2
+            exit 1
+          fi
+          if ! grep -q '^org/openrewrite/flix/spi/FlixTyper' typer-entries.txt; then
+            echo "Shaded typer jar has no typer facade." >&2
+            exit 1
+          fi
+          # The standard library ships inside as .flix resources; without it nothing
+          # type checks, and the failure would look like a mysterious resolution error.
+          if ! grep -q '\.flix$' typer-entries.txt; then
+            echo "Shaded typer jar carries no standard library sources." >&2
+            exit 1
+          fi
+
+          mkdir -p typer-probe
+          cat > TyperProbe.java <<'JAVA'
+          import org.openrewrite.flix.spi.FlixTypeCheckResult;
+          import org.openrewrite.flix.spi.FlixTyper;
+
+          public class TyperProbe {
+              public static void main(String[] args) {
+                  FlixTypeCheckResult typed = FlixTyper.typeCheck(
+                          "Probe.flix", "def main(): Unit \\ IO = println(\"hi\")\n");
+                  if (!typed.isTyped() || typed.getExpressions().isEmpty()) {
+                      throw new AssertionError("nothing typed: " + typed.getDiagnostics());
+                  }
+                  // A source that does not resolve must report diagnostics rather than
+                  // pretend to have types, which is what a consumer has to handle.
+                  FlixTypeCheckResult broken = FlixTyper.typeCheck(
+                          "Broken.flix", "def f(): Int32 = \"nope\"\n");
+                  if (broken.isTyped()) {
+                      throw new AssertionError("a type error went unreported");
+                  }
+                  System.out.println("typer jar is consumable from plain Java");
+              }
+          }
+          JAVA
+          "${JAVA_HOME}/bin/javac" -cp "$JAR" -d typer-probe TyperProbe.java
+          "${JAVA_HOME}/bin/java" -cp "typer-probe:$JAR" TyperProbe
+
       - name: Stage the Flix artifacts
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
@@ -260,6 +343,9 @@ jobs:
           # signature-preserving API jar for a Scala consumer that no longer
           # exists now that the boundary is Java.
           cp "tools/shade/build/libs/flix-parser-${RELEASE_TAG}.jar" "dist/flix-parser-${RELEASE_TAG}.jar"
+          # The typer ships separately: consumers that only parse should not carry the
+          # whole compiler and the standard library with it.
+          cp "tools/shade-typer/build/libs/flix-typer-${RELEASE_TAG}.jar" "dist/flix-typer-${RELEASE_TAG}.jar"
 
       - name: Upload the Flix artifacts
         uses: actions/upload-artifact@v7
@@ -444,6 +530,7 @@ jobs:
             shasum -a 256 \
               "flix-${RELEASE_TAG}.jar" \
               "flix-parser-${RELEASE_TAG}.jar" \
+              "flix-typer-${RELEASE_TAG}.jar" \
               "rewrite-m2-${RELEASE_TAG}.tar.gz" > "SHA256SUMS-${RELEASE_TAG}.txt"
           )
 
@@ -462,6 +549,7 @@ jobs:
           payloads = [
               f"flix-{tag}.jar",
               f"flix-parser-{tag}.jar",
+              f"flix-typer-{tag}.jar",
               f"rewrite-m2-{tag}.tar.gz",
               f"SHA256SUMS-{tag}.txt",
           ]

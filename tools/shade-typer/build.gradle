@@ -1,0 +1,26 @@
+// Relocates Scala in the typer artifact, exactly as tools/shade does for the parser.
+//
+// Unlike the parser this jar is NOT shrunk: type checking reaches the whole front-end
+// -- Weeder, Desugar, Namer, Resolver, Deriver, Typer -- and the standard library it
+// compiles ships inside as .flix resources. There is little to remove and a great deal
+// to break by trying.
+plugins {
+    id "java"
+    id "com.gradleup.shadow" version "9.6.1"
+}
+
+repositories { mavenCentral() }
+
+dependencies {
+    // The assembly with the typer facade merged in, produced earlier in the workflow.
+    implementation files("${rootDir}/typer-merged.jar")
+}
+
+tasks.named("shadowJar") {
+    archiveBaseName = "flix-typer"
+    archiveClassifier = ""
+    archiveVersion = providers.gradleProperty("artifactVersion").getOrElse("dev")
+    relocate "scala", "org.openrewrite.flix.shaded.scala"
+    // Bundled dependencies' own Maven metadata; see tools/shade.
+    exclude "META-INF/maven/**"
+}
