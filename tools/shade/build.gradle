@@ -19,6 +19,11 @@ tasks.named("shadowJar") {
     archiveClassifier = ""
     archiveVersion = providers.gradleProperty("artifactVersion").getOrElse("dev")
     relocate "scala", "org.openrewrite.flix.shaded.scala"
+    // Multi-release override classes (e.g. a Java 23 coursier variant pulled
+    // in transitively) target newer bytecode than Shadow's bundled ASM can
+    // parse. They're optional fast-path variants; dropping them leaves the
+    // base (non-versioned) class in place.
+    exclude "META-INF/versions/**"
 }
 
 // `gradle -p tools/shade shadowJar -PartifactVersion=<tag>`
