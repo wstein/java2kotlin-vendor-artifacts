@@ -33,10 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out this repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Check out tagged Flix source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: wstein/flix-fork
           ref: ${{ needs.validate.outputs.tag }}
@@ -44,7 +44,7 @@ jobs:
           fetch-depth: 1
 
       - name: Check out tagged Rewrite source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: wstein/rewrite-fork
           ref: ${{ needs.validate.outputs.tag }}
@@ -111,20 +111,23 @@ jobs:
 
           # scalac reads the .java sources for signatures but emits no class files
           # for them, so javac runs afterwards over the same sources.
-          java -cp "$SCALAC_CP" scala.tools.nsc.Main \
+          # Every JDK tool is invoked through JAVA_HOME rather than PATH: later
+          # actions reorder PATH and the image's default JDK is older than the one
+          # installed above, which surfaces as confusing class-file-version errors.
+          "${JAVA_HOME}/bin/java" -cp "$SCALAC_CP" scala.tools.nsc.Main \
             -classpath "$ASSEMBLY" -d facade-classes "@sources.txt"
           # --release 21 is required: built with the runner's JDK the facade's
           # class files carry that JDK's version and consumers cannot read them.
-          javac --release 21 -nowarn -cp "facade-classes:$ASSEMBLY" -d facade-classes \
-            "@java-sources.txt"
+          "${JAVA_HOME}/bin/javac" --release 21 -nowarn \
+            -cp "facade-classes:$ASSEMBLY" -d facade-classes "@java-sources.txt"
 
           cp "$ASSEMBLY" merged.jar
-          (cd facade-classes && jar uf ../merged.jar .)
+          (cd facade-classes && "${JAVA_HOME}/bin/jar" uf ../merged.jar .)
 
           curl -fsSL -o proguard.zip \
             "https://github.com/Guardsquare/proguard/releases/download/v${PROGUARD_VERSION}/proguard-${PROGUARD_VERSION}.zip"
           unzip -q proguard.zip
-          java -Xmx4g -jar "proguard-${PROGUARD_VERSION}/lib/proguard.jar" \
+          "${JAVA_HOME}/bin/java" -Xmx4g -jar "proguard-${PROGUARD_VERSION}/lib/proguard.jar" \
             @flix-facade.pro \
             -injars merged.jar \
             -outjars tools/shade/flix-parser-shrunk.jar \
@@ -132,7 +135,7 @@ jobs:
             -dontoptimize
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "9.6.1"
 
@@ -222,8 +225,13 @@ jobs:
           }
           JAVA
 
-          javac -cp "$JAR" -d probe Probe.java
-          java -cp "probe:$JAR" Probe
+          # Use the JDK this workflow installed, not whatever `javac` PATH resolves
+          # to. Later actions reorder PATH, and the runner image's default javac is
+          # older than the JDK the facade is compiled against -- which fails as
+          # "class file has wrong version 65.0, should be 61.0", i.e. the artifact
+          # is fine and the compiler reading it is too old.
+          "${JAVA_HOME}/bin/javac" -cp "$JAR" -d probe Probe.java
+          "${JAVA_HOME}/bin/java" -cp "probe:$JAR" Probe
 
       - name: Publish required Rewrite modules locally
         working-directory: rewrite
@@ -279,7 +287,7 @@ jobs:
           )
 
       - name: Upload canonical release files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vendor-release
           path: dist/
@@ -290,7 +298,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release
           merge-multiple: true
