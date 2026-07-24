@@ -23,6 +23,10 @@ tasks.named("shadowJar") {
     archiveClassifier = ""
     archiveVersion = providers.gradleProperty("artifactVersion").getOrElse("dev")
     relocate "scala", "org.openrewrite.flix.shaded.scala"
+    // Bundled dependencies bring their own META-INF/maven/**/pom.xml. Left in,
+    // any tool that reads embedded Maven metadata -- `mvn install-file` among
+    // them -- can mistake this jar for one of them.
+    exclude "META-INF/maven/**"
 }
 
 // `gradle -p tools/shade shadowJar -PartifactVersion=<tag>`
