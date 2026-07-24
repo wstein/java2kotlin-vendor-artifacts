@@ -46,6 +46,19 @@ import scala.collection.mutable
 object FlixTyper {
 
   /**
+   * A reserved directory the source under test is placed under.
+   *
+   * Inputs are keyed by their path string, and the standard library is added under
+   * bare module paths -- `List.flix`, `String.flix`, `Option.flix`. A source that
+   * happened to be named after a library module would key to the same string and
+   * silently REPLACE that module, so its type would then be undefined. Namespacing the
+   * source under a directory the library never uses removes the collision; the
+   * directory is cosmetic, because a Flix file's path does not determine its module (a
+   * `mod` declaration does).
+   */
+  private val InputRoot = "rewrite-flix-input"
+
+  /**
    * Type checks `source` and returns the types of the expressions belonging to it.
    *
    * Expressions from the standard library are excluded: they are typed as a consequence
@@ -54,8 +67,12 @@ object FlixTyper {
   def typeCheck(path: String, source: String): FlixTypeCheckResult = {
     implicit val sctx: SecurityContext = SecurityContext.Default
 
+    // See InputRoot: the source is placed under a reserved directory so a file named
+    // after a standard-library module cannot clobber it.
+    val inputPath = InputRoot + "/" + path
+
     val flix = new Flix()
-    flix.addVirtualPath(Paths.get(path), source)
+    flix.addVirtualPath(Paths.get(inputPath), source)
     val (rootOpt, errors) = flix.check()
 
     val diagnostics = new ju.ArrayList[String]()
@@ -66,7 +83,7 @@ object FlixTyper {
       val collected = mutable.ArrayBuffer.empty[TypedAst.Expr]
       collect(root.defs, collected)
       collected.foreach { e =>
-        if (belongsTo(e.loc, path)) {
+        if (belongsTo(e.loc, inputPath)) {
           expressions.add(new FlixTypedExpression(
             e.loc.start.lineOneIndexed, e.loc.start.colOneIndexed,
             e.loc.end.lineOneIndexed, e.loc.end.colOneIndexed,
@@ -99,7 +116,11 @@ object FlixTyper {
     case _ => ()
   }
 
-  /** Whether a location came from the source the caller asked about. */
-  private def belongsTo(loc: SourceLocation, path: String): Boolean =
-    loc.source.name == path || loc.source.name.endsWith("/" + path)
+  /**
+   * Whether a location came from the source under test rather than the standard
+   * library. An exact match on the namespaced path: the library is never added under
+   * InputRoot, so nothing of its own can match.
+   */
+  private def belongsTo(loc: SourceLocation, inputPath: String): Boolean =
+    loc.source.name == inputPath
 }
