@@ -28,42 +28,8 @@ jobs:
           fi
           echo "tag=vendor-$VERSION" >> "$GITHUB_OUTPUT"
 
-  tag-sources:
-    needs: validate
-    runs-on: ubuntu-latest
-    outputs:
-      flix_commit: ${{ steps.tag.outputs.flix_commit }}
-      rewrite_commit: ${{ steps.tag.outputs.rewrite_commit }}
-    steps:
-      - id: tag
-        env:
-          # This fine-grained PAT needs Contents: Read and write on both
-          # forks. A workflow GITHUB_TOKEN is confined to this repository;
-          # it is used only to verify tags on retries.
-          GH_TOKEN: ${{ secrets.VENDOR_FORKS_TOKEN || github.token }}
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          set -euo pipefail
-          tag_head() {
-            local repo="$1"
-            local sha tagged_sha
-            sha="$(gh api "repos/$repo/git/ref/heads/feature/java2kotlin" --jq .object.sha)"
-            if gh api "repos/$repo/git/ref/tags/$TAG" >/dev/null 2>&1; then
-              tagged_sha="$(gh api "repos/$repo/git/ref/tags/$TAG" --jq .object.sha)"
-              test "$tagged_sha" = "$sha" || {
-                echo "$repo tag $TAG does not identify the current feature/java2kotlin head" >&2
-                exit 1
-              }
-            else
-              gh api --method POST "repos/$repo/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$sha" >/dev/null
-            fi
-            printf '%s\n' "$sha"
-          }
-          echo "flix_commit=$(tag_head wstein/flix-fork)" >> "$GITHUB_OUTPUT"
-          echo "rewrite_commit=$(tag_head wstein/rewrite-fork)" >> "$GITHUB_OUTPUT"
-
   build:
-    needs: [validate, tag-sources]
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged Flix source
@@ -87,15 +53,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-
-      - name: Verify immutable source identities
-        env:
-          EXPECTED_FLIX: ${{ needs.tag-sources.outputs.flix_commit }}
-          EXPECTED_REWRITE: ${{ needs.tag-sources.outputs.rewrite_commit }}
-        run: |
-          set -euo pipefail
-          test "$(git -C flix rev-parse HEAD)" = "$EXPECTED_FLIX"
-          test "$(git -C rewrite rev-parse HEAD)" = "$EXPECTED_REWRITE"
 
       - name: Build Flix assembly
         working-directory: flix
@@ -150,10 +107,10 @@ jobs:
       - name: Package canonical vendor artifacts
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-          FLIX_COMMIT: ${{ needs.tag-sources.outputs.flix_commit }}
-          REWRITE_COMMIT: ${{ needs.tag-sources.outputs.rewrite_commit }}
         run: |
           set -euo pipefail
+          FLIX_COMMIT="$(git -C flix rev-parse HEAD)"
+          REWRITE_COMMIT="$(git -C rewrite rev-parse HEAD)"
           mkdir -p dist/m2-repository/org
           cp flix/out/flix/assembly.dest/out.jar "dist/flix-${RELEASE_TAG}.jar"
           cp "tools/shade/build/libs/flix-parser-${RELEASE_TAG}.jar" "dist/flix-parser-${RELEASE_TAG}.jar"
@@ -188,7 +145,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [validate, tag-sources, build]
+    needs: [validate, build]
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts
@@ -201,10 +158,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
-          FLIX_COMMIT: ${{ needs.tag-sources.outputs.flix_commit }}
-          REWRITE_COMMIT: ${{ needs.tag-sources.outputs.rewrite_commit }}
         run: |
           set -euo pipefail
+          FLIX_COMMIT="$(jq -r .flixCommit release/manifest-*.json)"
+          REWRITE_COMMIT="$(jq -r .rewriteCommit release/manifest-*.json)"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Refusing to modify existing release $TAG" >&2
             exit 1

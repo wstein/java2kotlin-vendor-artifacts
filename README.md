@@ -12,14 +12,24 @@ each project's ordinary source-version tags.
 
 ## Publishing a release
 
-Run **Publish vendor artifacts** from Actions and provide only:
+Before publishing, create matching `vendor-YYYY.MM.DD.N` tags on both fork
+repositories, pointing to the tip of the `feature/java2kotlin` branch:
 
-- a release version such as `2026.07.20.1`;
+```bash
+# On wstein/flix-fork
+git checkout feature/java2kotlin
+git tag vendor-2026.07.20.1
+git push origin vendor-2026.07.20.1
 
-Before publishing, configure the `VENDOR_FORKS_TOKEN` Actions secret with a
-fine-grained token that has **Contents: read and write** access to
-`wstein/flix-fork` and `wstein/rewrite-fork`. It is used solely to create the
-matching immutable source tags.
+# On wstein/rewrite-fork
+git checkout feature/java2kotlin
+git tag vendor-2026.07.20.1
+git push origin vendor-2026.07.20.1
+```
+
+Then run **Publish vendor artifacts** from Actions and provide:
+
+- a release version such as `2026.07.20.1` (must match the tags created above);
 
 The workflow builds one generic, versioned `flix-vendor-*.jar` (the full Flix
 compiler), one generic, versioned `flix-parser-*.jar` (the slim, R8-shrunk and
