@@ -61,110 +61,169 @@ jobs:
         working-directory: flix
         run: ./mill flix.assembly
 
-      # Shrink the assembly to the decoupled front-end (Lexer + Parser2 + the
-      # SyntaxTree/Token API) with R8, seeded by flix-parser.pro. Dead-method
-      # elimination drops the Weeder/Resolver/Typer/backend, which the parse
-      # path never calls. Requires the flix fork's feature/java2kotlin branch to
-      # carry the Flix-decoupling of Lexer.run/Parser2.run.
-      - name: Shrink to slim parser jar (R8)
-        env:
-          R8_VERSION: "9.1.31"
-        run: |
-          set -euo pipefail
-          curl -fsSL -o r8.jar \
-            "https://maven.google.com/com/android/tools/r8/${R8_VERSION}/r8-${R8_VERSION}.jar"
-          java -cp r8.jar com.android.tools.r8.R8 \
-            --classfile \
-            --lib "${JAVA_HOME}" \
-            --output tools/shade/flix-parser-shrunk.jar \
-            --pg-conf flix-parser.pro \
-            flix/out/flix/assembly.dest/out.jar
-
-      # Compile-time counterpart to the R8 jar above. R8 removes every Scala
-      # pickle signature, so the slim runtime jar cannot be compiled against:
-      # scalac reads the Flix classes as plain Java classes and case-class
-      # companions fail to resolve. ProGuard retains the signatures under the
-      # same keep rules, so it produces the artifact consumers compile against
-      # -- 32 MB full assembly -> ~1.6 MB. See flix-parser-api.pro.
-      - name: Build compile-time API jar (ProGuard)
+      # Build the published parser jar: compile the pure-Java facade against the
+      # assembly, merge it in, then shrink from the facade as the only root.
+      #
+      # The facade is what makes the artifact usable. Shading relocates `scala`,
+      # which rewrites the Flix front-end's own public signatures -- Lexer.run
+      # would take a relocated Map -- so a consumer compiled against the real
+      # Scala library dies with NoSuchMethodError, and shading the consumer too
+      # is impossible because scalac hardwires scala.Any and refuses to compile
+      # against a relocated standard library. With the boundary carrying only
+      # Java types, the relocation is invisible and consumers need no Scala.
+      #
+      # That also means the jar only has to RUN: consumers compile against the
+      # Java facade, never against the Scala classes, so pickle signatures need
+      # not survive and the artifact can be both aggressively shrunk and shaded.
+      #
+      # Requires the flix fork branch being built to carry the decoupling of
+      # Lexer.run/Parser2.run from the Flix god-object; without it the whole
+      # compiler, including the JVM backend, is reachable and nothing shrinks.
+      - name: Build the parser jar (facade + ProGuard)
         env:
           PROGUARD_VERSION: "7.9.1"
+          SCALA_VERSION: "2.13.18"
         run: |
           set -euo pipefail
+          ASSEMBLY=flix/out/flix/assembly.dest/out.jar
+
+          # The facade is compiled against the assembly, so it must be built with
+          # the same Scala the assembly was. Drift here would fail confusingly
+          # deep inside scalac, so check it up front.
+          if ! grep -q "def scalaVersion = \"${SCALA_VERSION}\"" flix/build.mill; then
+            echo "flix/build.mill does not use Scala ${SCALA_VERSION}; update SCALA_VERSION." >&2
+            grep -n "scalaVersion" flix/build.mill >&2
+            exit 1
+          fi
+
+          mkdir -p scalac
+          for artifact in scala-compiler scala-library scala-reflect; do
+            curl -fsSL -o "scalac/${artifact}.jar" \
+              "https://repo1.maven.org/maven2/org/scala-lang/${artifact}/${SCALA_VERSION}/${artifact}-${SCALA_VERSION}.jar"
+          done
+          SCALAC_CP="scalac/scala-compiler.jar:scalac/scala-library.jar:scalac/scala-reflect.jar"
+
+          mkdir -p facade-classes
+          # Source lists go through argument files rather than unquoted command
+          # substitution, so a path containing a space cannot split into two args.
+          find facade/src/main \( -name '*.scala' -o -name '*.java' \) > sources.txt
+          find facade/src/main/java -name '*.java' > java-sources.txt
+
+          # scalac reads the .java sources for signatures but emits no class files
+          # for them, so javac runs afterwards over the same sources.
+          java -cp "$SCALAC_CP" scala.tools.nsc.Main \
+            -classpath "$ASSEMBLY" -d facade-classes "@sources.txt"
+          # --release 21 is required: built with the runner's JDK the facade's
+          # class files carry that JDK's version and consumers cannot read them.
+          javac --release 21 -nowarn -cp "facade-classes:$ASSEMBLY" -d facade-classes \
+            "@java-sources.txt"
+
+          cp "$ASSEMBLY" merged.jar
+          (cd facade-classes && jar uf ../merged.jar .)
+
           curl -fsSL -o proguard.zip \
             "https://github.com/Guardsquare/proguard/releases/download/v${PROGUARD_VERSION}/proguard-${PROGUARD_VERSION}.zip"
           unzip -q proguard.zip
-          # The output filter keeps class files only. Any stray resource is a
-          # hazard: a root `library.properties` alone is enough to make scalac
-          # mistake this jar for the Scala library. `scala/**` is excluded so
-          # the partial copy cannot shadow the consumer's real scala-library.
           java -Xmx4g -jar "proguard-${PROGUARD_VERSION}/lib/proguard.jar" \
-            @flix-parser-api.pro \
-            -injars flix/out/flix/assembly.dest/out.jar \
-            -outjars 'flix-parser-api.jar(ca/**.class,org/**.class)' \
-            -libraryjars "${JAVA_HOME}/jmods/java.base.jmod(!**.jar;!module-info.class)"
-
-      # Guard the three properties the API jar is useless without. Each has
-      # already been observed to fail in practice, so none is theoretical.
-      - name: Verify the API jar is compilable against
-        run: |
-          set -euo pipefail
-          fail=0
-
-          # 1. Pickle signatures must survive the shrink (this is what R8 loses).
-          unzip -p flix-parser-api.jar \
-            ca/uwaterloo/flix/language/ast/SyntaxTree.class > SyntaxTree.class
-          if ! javap -v SyntaxTree.class | grep -q ScalaSignature; then
-            echo "API jar lost ScalaSignature; scalac cannot compile against it." >&2
-            fail=1
-          fi
-
-          # `unzip -Z1` lists entry names only, with no header or summary rows
-          # to parse around.
-          unzip -Z1 flix-parser-api.jar > entries.txt
-
-          # 2. No partial scala-library, which breaks scalac's symbol table.
-          if grep -qE '^scala/' entries.txt; then
-            echo "API jar bundles scala/**; it would shadow the real scala-library." >&2
-            fail=1
-          fi
-
-          # 3. Class files only -- see the library.properties hazard above.
-          if grep -vE '\.class$|/$' entries.txt | grep -q .; then
-            echo "API jar contains non-class resources:" >&2
-            grep -vE '\.class$|/$' entries.txt >&2
-            fail=1
-          fi
-
-          exit "$fail"
+            @flix-facade.pro \
+            -injars merged.jar \
+            -outjars tools/shade/flix-parser-shrunk.jar \
+            -libraryjars "${JAVA_HOME}/jmods/java.base.jmod(!**.jar;!module-info.class)" \
+            -dontoptimize
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "9.6.1"
 
-      # Relocate Scala 2.13 into a private namespace so the parser can coexist
-      # with rewrite-scala (Scala 3) on one classpath.
+      # Relocate Scala into a private namespace so the parser can share a
+      # classpath with rewrite-scala, which resolves the same
+      # org.scala-lang:scala-library coordinate to a different major version.
       #
-      # KNOWN LIMITATION -- the shaded jar is not consumable from Scala sources.
-      # Relocating `scala` rewrites the Flix front-end's own public signatures
-      # (Lexer.run and ReadAst.Root take scala.collection.immutable.Map), so a
-      # consumer compiled against the unshaded API jar fails at runtime with
-      #   NoSuchMethodError: ca.uwaterloo.flix.language.ast.ReadAst$Root.<init>(
-      #     scala.collection.immutable.Map, ...AvailableClasses)
-      # (reproduced against this jar). It cannot be fixed by shading the
-      # consumer's compile classpath too: scalac hardwires scala.Any/scala.Predef
-      # and refuses to compile against a relocated standard library.
-      #
-      # The resolution is to make the artifact's boundary pure Java -- a small
-      # Java facade compiled INTO this jar before shading, exposing the CST with
-      # Java-typed signatures -- after which the consumer needs no Scala at all.
-      # Until then rewrite-flix consumes the UNSHADED R8 output and the shaded
-      # jar is published for evaluation only.
+      # Only Scala moves. The facade package (org.openrewrite.flix.spi) and the
+      # Flix classes keep their names, so the published boundary is untouched by
+      # the relocation -- which is the whole reason the facade exists.
       - name: Shade Scala (Gradle Shadow)
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: gradle -p tools/shade shadowJar -PartifactVersion="${RELEASE_TAG}"
+
+      # Prove the published jar is usable BEFORE publishing it, by exercising it
+      # the way a consumer will: plain Java, with only the shaded jar on the
+      # classpath and no scala-library anywhere.
+      #
+      # This is the guard that was missing. A previous release shipped a parser
+      # jar that could not be compiled against at all and failed at runtime with
+      # NoSuchMethodError on ReadAst$Root, and nothing in the pipeline noticed.
+      - name: Verify the published jar is consumable
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          JAR="tools/shade/build/libs/flix-parser-${RELEASE_TAG}.jar"
+
+          # List the entries once and grep the file, rather than piping unzip into
+          # grep. Under `set -o pipefail`, `grep -q` exits on its first match and
+          # unzip dies of SIGPIPE, so the pipeline reports failure precisely when
+          # the pattern IS found -- which inverts both checks below and makes the
+          # unshaded-scala one incapable of ever firing.
+          unzip -Z1 "$JAR" > entries.txt
+
+          # Scala must be fully relocated; a stray unshaded entry would collide
+          # with the consumer's own Scala.
+          if grep -qE '^scala/' entries.txt; then
+            echo "Shaded jar still contains unshaded scala/**." >&2
+            exit 1
+          fi
+          # ...and the facade must NOT have been relocated, or the entry point moved.
+          if ! grep -q '^org/openrewrite/flix/spi/' entries.txt; then
+            echo "Shaded jar has no facade; consumers have no entry point." >&2
+            exit 1
+          fi
+
+          mkdir -p probe
+          cat > Probe.java <<'JAVA'
+          import org.openrewrite.flix.spi.FlixCstElement;
+          import org.openrewrite.flix.spi.FlixCstNode;
+          import org.openrewrite.flix.spi.FlixCstToken;
+          import org.openrewrite.flix.spi.FlixFrontEnd;
+          import org.openrewrite.flix.spi.FlixParseResult;
+
+          public class Probe {
+              public static void main(String[] args) {
+                  String source = "def main(): Unit \\ IO = println(\"hi\")\n";
+                  FlixParseResult result = FlixFrontEnd.parse("Probe.flix", source);
+                  if (!result.getDiagnostics().isEmpty()) {
+                      throw new AssertionError("unexpected diagnostics: " + result.getDiagnostics());
+                  }
+                  // Reconstructing the source from token offsets proves the CST covers
+                  // the file, which is what lossless printing depends on.
+                  StringBuilder out = new StringBuilder();
+                  int[] cursor = {0};
+                  rebuild(result.getTree(), source, out, cursor);
+                  out.append(source.substring(cursor[0]));
+                  if (!out.toString().equals(source)) {
+                      throw new AssertionError("round trip differed: " + out);
+                  }
+                  System.out.println("parser jar is consumable from plain Java");
+              }
+
+              static void rebuild(FlixCstElement e, String src, StringBuilder out, int[] cursor) {
+                  if (e instanceof FlixCstToken) {
+                      FlixCstToken t = (FlixCstToken) e;
+                      out.append(src, cursor[0], t.getStart()).append(src, t.getStart(), t.getEnd());
+                      cursor[0] = t.getEnd();
+                      return;
+                  }
+                  for (FlixCstElement c : ((FlixCstNode) e).getChildren()) {
+                      rebuild(c, src, out, cursor);
+                  }
+              }
+          }
+          JAVA
+
+          javac -cp "$JAR" -d probe Probe.java
+          java -cp "probe:$JAR" Probe
 
       - name: Publish required Rewrite modules locally
         working-directory: rewrite
@@ -190,11 +249,12 @@ jobs:
           REWRITE_COMMIT="$(git -C rewrite rev-parse HEAD)"
           mkdir -p dist/m2-repository/org
           cp flix/out/flix/assembly.dest/out.jar "dist/flix-${RELEASE_TAG}.jar"
+          # One parser artifact: shrunk, shaded, and consumable from plain Java.
+          # It replaces the earlier trio -- an R8 jar that could not be compiled
+          # against, an unshaded copy to work around that, and a
+          # signature-preserving API jar for a Scala consumer that no longer
+          # exists now that the boundary is Java.
           cp "tools/shade/build/libs/flix-parser-${RELEASE_TAG}.jar" "dist/flix-parser-${RELEASE_TAG}.jar"
-          # Unshaded R8 output: what rewrite-flix actually runs against today,
-          # for the reason recorded on the shade step above.
-          cp tools/shade/flix-parser-shrunk.jar "dist/flix-parser-unshaded-${RELEASE_TAG}.jar"
-          cp flix-parser-api.jar "dist/flix-parser-api-${RELEASE_TAG}.jar"
           cp -R "$HOME/.m2/repository/org/openrewrite" dist/m2-repository/org/
           tar -C dist -czf "dist/rewrite-m2-${RELEASE_TAG}.tar.gz" m2-repository
           rm -rf dist/m2-repository
@@ -215,8 +275,6 @@ jobs:
             shasum -a 256 \
               "flix-${RELEASE_TAG}.jar" \
               "flix-parser-${RELEASE_TAG}.jar" \
-              "flix-parser-unshaded-${RELEASE_TAG}.jar" \
-              "flix-parser-api-${RELEASE_TAG}.jar" \
               "rewrite-m2-${RELEASE_TAG}.tar.gz" > "SHA256SUMS-${RELEASE_TAG}.txt"
           )
 

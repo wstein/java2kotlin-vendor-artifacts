@@ -1,7 +1,11 @@
-// Relocates Scala 2.13 in the R8-shrunk Flix parser jar into a private
-// namespace so rewrite-flix can share a classpath with rewrite-scala (Scala 3),
-// which owns the same scala.* packages. Only Scala is relocated; the Flix
-// front-end classes (ca.uwaterloo.flix.*) keep their names.
+// Relocates Scala in the shrunk Flix parser jar into a private namespace so
+// rewrite-flix can share a classpath with rewrite-scala, which resolves the same
+// org.scala-lang:scala-library coordinate to a different major version.
+//
+// Only Scala is relocated. The Flix front-end classes (ca.uwaterloo.flix.*) and
+// the facade (org.openrewrite.flix.spi.*) keep their names, so the boundary
+// consumers compile against is unaffected -- which is what makes the shaded jar
+// usable at all.
 plugins {
     id "java"
     id "com.gradleup.shadow" version "9.6.1"
@@ -10,7 +14,7 @@ plugins {
 repositories { mavenCentral() }
 
 dependencies {
-    // The R8 output produced earlier in the workflow.
+    // The ProGuard output produced earlier in the workflow.
     implementation files("${rootDir}/flix-parser-shrunk.jar")
 }
 
