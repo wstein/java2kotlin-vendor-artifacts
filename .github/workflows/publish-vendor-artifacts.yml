@@ -101,6 +101,37 @@ jobs:
         working-directory: flix
         run: ./mill flix.assembly
 
+      # Shrink the assembly to the decoupled front-end (Lexer + Parser2 + the
+      # SyntaxTree/Token API) with R8, seeded by flix-parser.pro. Dead-method
+      # elimination drops the Weeder/Resolver/Typer/backend, which the parse
+      # path never calls. Requires the flix fork's feature/java2kotlin branch to
+      # carry the Flix-decoupling of Lexer.run/Parser2.run.
+      - name: Shrink to slim parser jar (R8)
+        env:
+          R8_VERSION: "9.1.31"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o r8.jar \
+            "https://maven.google.com/com/android/tools/r8/${R8_VERSION}/r8-${R8_VERSION}.jar"
+          java -cp r8.jar com.android.tools.r8.R8 \
+            --classfile \
+            --lib "${JAVA_HOME}" \
+            --output tools/shade/flix-parser-shrunk.jar \
+            --pg-conf flix-parser.pro \
+            flix/out/flix/assembly.dest/out.jar
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11"
+
+      # Relocate Scala 2.13 into a private namespace so the parser can coexist
+      # with rewrite-scala (Scala 3) on one classpath.
+      - name: Shade Scala (Gradle Shadow)
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: gradle -p tools/shade shadowJar -PartifactVersion="${RELEASE_TAG}"
+
       - name: Publish required Rewrite modules locally
         working-directory: rewrite
         run: >-
@@ -125,6 +156,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist/m2-repository/org
           cp flix/out/flix/assembly.dest/out.jar "dist/flix-${RELEASE_TAG}.jar"
+          cp "tools/shade/build/libs/flix-parser-${RELEASE_TAG}.jar" "dist/flix-parser-${RELEASE_TAG}.jar"
           cp -R "$HOME/.m2/repository/org/openrewrite" dist/m2-repository/org/
           tar -C dist -czf "dist/rewrite-m2-${RELEASE_TAG}.tar.gz" m2-repository
           rm -rf dist/m2-repository
@@ -142,7 +174,10 @@ jobs:
             # `shasum` is available on both GitHub's Linux and Intel macOS
             # images; GNU-only `sha256sum` is not available by default on
             # macOS.
-            shasum -a 256 "flix-${RELEASE_TAG}.jar" "rewrite-m2-${RELEASE_TAG}.tar.gz" > "SHA256SUMS-${RELEASE_TAG}.txt"
+            shasum -a 256 \
+              "flix-${RELEASE_TAG}.jar" \
+              "flix-parser-${RELEASE_TAG}.jar" \
+              "rewrite-m2-${RELEASE_TAG}.tar.gz" > "SHA256SUMS-${RELEASE_TAG}.txt"
           )
 
       - name: Upload canonical release files

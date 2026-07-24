@@ -1,1 +1,5 @@
-.DS_Store
+.gradle/
+tools/shade/build/
+tools/shade/flix-parser-shrunk.jar
+r8.jar
+dist/
